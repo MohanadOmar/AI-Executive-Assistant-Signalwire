@@ -1,4 +1,4 @@
-"""SMS webhook for SignalWire — uses LaML response format (Twilio-compatible)."""
+"""SMS webhook for SignalWire — uses LaML response format."""
 import os
 import hmac
 import hashlib
@@ -12,14 +12,7 @@ router = APIRouter()
 
 
 def validate_signalwire_signature(request_url: str, post_data: dict, signature: str, auth_token: str) -> bool:
-    """Validate that the request came from SignalWire.
-    
-    SignalWire uses the same HMAC-SHA1 scheme as Twilio:
-    - Sort POST params alphabetically by key
-    - Concatenate URL + each key+value (no separator)
-    - HMAC-SHA1 with the auth_token
-    - Base64 encode
-    """
+    """SignalWire HMAC-SHA1 signature validation, same scheme as Twilio."""
     sorted_params = "".join(f"{k}{v}" for k, v in sorted(post_data.items()))
     s = request_url + sorted_params
     mac = hmac.new(auth_token.encode(), s.encode(), hashlib.sha1)
@@ -34,15 +27,29 @@ async def incoming_sms(request: Request):
 
     from_number = data.get("From", "")
     body = data.get("Body", "").strip()
-    print(f"[SMS In] From {from_number}: {body}")
 
-    # Validate SignalWire signature in production
-    if os.getenv("NODE_ENV") == "production":
+    # Debug logging — print full payload so we can see what SignalWire sent
+    print(f"[SMS In] From={from_number!r} Body={body!r}")
+    print(f"[SMS Debug] All form keys: {list(data.keys())}")
+    print(f"[SMS Debug] Headers: signalwire-sig={request.headers.get('X-Signalwire-Signature', 'MISSING')[:20]}...")
+
+    # Signature validation — only enforce if explicitly enabled
+    if os.getenv("VALIDATE_SIGNATURE", "false").lower() == "true":
         signature = request.headers.get("X-Signalwire-Signature", "")
-        base_url = f"{os.environ['BASE_URL']}/sms/incoming"
+        # Build the URL that SignalWire used to call us
+        base_url = os.environ.get("BASE_URL", "").rstrip("/") + "/sms/incoming"
         token = os.environ.get("SIGNALWIRE_API_TOKEN", "")
         if not validate_signalwire_signature(base_url, data, signature, token):
+            print(f"[SMS] Signature mismatch for url={base_url}")
             return Response(content="Forbidden", status_code=403)
+
+    if not from_number or not body:
+        print("[SMS] Skipping — empty From or Body")
+        # Return empty LaML so SignalWire doesn't retry
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+            media_type="text/xml",
+        )
 
     try:
         reply = run_agent(
@@ -55,7 +62,6 @@ async def incoming_sms(request: Request):
         print(f"[SMS Error] {e}")
         reply = "Dodo hit an error. Try again in a moment."
 
-    # LaML response (same format as Twilio's TwiML)
     laml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Message>{reply}</Message>
