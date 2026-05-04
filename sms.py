@@ -1,8 +1,9 @@
-"""SMS webhook for SignalWire — uses LaML response format."""
+"""SMS webhook for SignalWire — handles both LaML (form) and JSON webhooks."""
 import os
 import hmac
 import hashlib
 import base64
+import json
 from fastapi import APIRouter, Request, Response
 
 from agent import run_agent
@@ -11,41 +12,63 @@ from system_prompts import get_sms_system_prompt
 router = APIRouter()
 
 
-def validate_signalwire_signature(request_url: str, post_data: dict, signature: str, auth_token: str) -> bool:
-    """SignalWire HMAC-SHA1 signature validation, same scheme as Twilio."""
-    sorted_params = "".join(f"{k}{v}" for k, v in sorted(post_data.items()))
-    s = request_url + sorted_params
-    mac = hmac.new(auth_token.encode(), s.encode(), hashlib.sha1)
-    expected = base64.b64encode(mac.digest()).decode()
-    return hmac.compare_digest(expected, signature)
+async def parse_signalwire_payload(request: Request) -> dict:
+    """Parse SignalWire payload — handles both form-encoded (LaML) and JSON."""
+    content_type = request.headers.get("content-type", "")
+    print(f"[SMS Debug] Content-Type: {content_type}")
+
+    # Read raw body for logging + JSON parsing
+    raw = await request.body()
+    print(f"[SMS Debug] Raw body length: {len(raw)} bytes")
+    if raw:
+        print(f"[SMS Debug] Raw body preview: {raw[:300]!r}")
+
+    # Try JSON first
+    if "application/json" in content_type:
+        try:
+            payload = json.loads(raw)
+            # SignalWire JSON webhook nests message info — flatten it
+            # Common shapes: { "From": "...", "Body": "..." } or { "params": { "from": ..., "body": ... } }
+            if "params" in payload and isinstance(payload["params"], dict):
+                p = payload["params"]
+                return {
+                    "From": p.get("from") or p.get("From", ""),
+                    "Body": p.get("body") or p.get("Body", ""),
+                    "To": p.get("to") or p.get("To", ""),
+                    **payload,
+                }
+            return payload
+        except Exception as e:
+            print(f"[SMS] JSON parse failed: {e}")
+
+    # Fall back to form-encoded
+    try:
+        form = await request.form()
+        return dict(form)
+    except Exception as e:
+        print(f"[SMS] Form parse failed: {e}")
+
+    # Last resort — try parsing raw as form
+    try:
+        from urllib.parse import parse_qs
+        parsed = parse_qs(raw.decode())
+        return {k: v[0] if v else "" for k, v in parsed.items()}
+    except Exception:
+        return {}
 
 
 @router.post("/incoming")
 async def incoming_sms(request: Request):
-    form = await request.form()
-    data = dict(form)
+    data = await parse_signalwire_payload(request)
 
-    from_number = data.get("From", "")
-    body = data.get("Body", "").strip()
+    from_number = data.get("From", "") or data.get("from", "")
+    body = (data.get("Body", "") or data.get("body", "")).strip()
 
-    # Debug logging — print full payload so we can see what SignalWire sent
     print(f"[SMS In] From={from_number!r} Body={body!r}")
-    print(f"[SMS Debug] All form keys: {list(data.keys())}")
-    print(f"[SMS Debug] Headers: signalwire-sig={request.headers.get('X-Signalwire-Signature', 'MISSING')[:20]}...")
-
-    # Signature validation — only enforce if explicitly enabled
-    if os.getenv("VALIDATE_SIGNATURE", "false").lower() == "true":
-        signature = request.headers.get("X-Signalwire-Signature", "")
-        # Build the URL that SignalWire used to call us
-        base_url = os.environ.get("BASE_URL", "").rstrip("/") + "/sms/incoming"
-        token = os.environ.get("SIGNALWIRE_API_TOKEN", "")
-        if not validate_signalwire_signature(base_url, data, signature, token):
-            print(f"[SMS] Signature mismatch for url={base_url}")
-            return Response(content="Forbidden", status_code=403)
+    print(f"[SMS Debug] All keys: {list(data.keys())}")
 
     if not from_number or not body:
         print("[SMS] Skipping — empty From or Body")
-        # Return empty LaML so SignalWire doesn't retry
         return Response(
             content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
             media_type="text/xml",
@@ -62,6 +85,7 @@ async def incoming_sms(request: Request):
         print(f"[SMS Error] {e}")
         reply = "Dodo hit an error. Try again in a moment."
 
+    # Always return LaML — works for both LaML and JSON webhook configs
     laml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Message>{reply}</Message>
