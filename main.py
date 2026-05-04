@@ -5,7 +5,6 @@ import asyncio
 import uvicorn
 
 from sms import router as sms_router
-from gmail_monitor import router as gmail_router
 from gmail_poller import start_poller
 
 
@@ -18,7 +17,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 app.include_router(sms_router, prefix="/sms")
-app.include_router(gmail_router, prefix="/gmail")
 
 
 @app.get("/health")
